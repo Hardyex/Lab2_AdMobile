@@ -1,6 +1,7 @@
 import React, {useCallback, useEffect, useState} from 'react';
 import {
   ActivityIndicator,
+  AppState,
   Pressable,
   StatusBar,
   StyleSheet,
@@ -10,11 +11,13 @@ import {
 } from 'react-native';
 import Slider from '@react-native-community/slider';
 import {
+  canWriteSystemSettings,
   getBatteryPercentage,
-  setWindowBrightness,
+  getSystemBrightness,
+  openSystemBrightnessSettings,
+  setSystemBrightness,
+  subscribeToSystemBrightness,
 } from './src/native/DeviceFeatures';
-
-const INITIAL_BRIGHTNESS = 50;
 
 function getErrorMessage(error) {
   return error instanceof Error ? error.message : 'Something went wrong.';
@@ -52,7 +55,9 @@ function SunCircle({percentage}) {
         );
       })}
       <View style={sunStyles.innerCircle}>
-        <Text style={sunStyles.pctText}>{percentage}%</Text>
+        <Text style={sunStyles.pctText}>
+          {percentage === null ? '--%' : `${percentage}%`}
+        </Text>
       </View>
     </View>
   );
@@ -241,7 +246,8 @@ export default function App() {
   const [batteryPercentage, setBatteryPercentage] = useState(null);
   const [batteryError, setBatteryError]         = useState('');
   const [isRefreshing, setIsRefreshing]         = useState(false);
-  const [brightness, setBrightness]             = useState(INITIAL_BRIGHTNESS);
+  const [brightness, setBrightness]             = useState(null);
+  const [canModifySystemSettings, setCanModifySystemSettings] = useState(null);
   const [brightnessError, setBrightnessError]   = useState('');
 
   const refreshBattery = useCallback(async () => {
@@ -260,10 +266,20 @@ export default function App() {
     }
   }, []);
 
-  const applyBrightness = useCallback(async value => {
-    setBrightnessError('');
+  const refreshBrightness = useCallback(async (clearError = true) => {
     try {
-      await setWindowBrightness(value);
+      const [value, canWrite] = await Promise.all([
+        getSystemBrightness(),
+        canWriteSystemSettings(),
+      ]);
+      if (!Number.isInteger(value) || value < 0 || value > 100) {
+        throw new Error('Android returned an invalid system brightness percentage.');
+      }
+      setBrightness(value);
+      setCanModifySystemSettings(canWrite);
+      if (clearError) {
+        setBrightnessError('');
+      }
     } catch (error) {
       setBrightnessError(getErrorMessage(error));
     }
@@ -271,13 +287,52 @@ export default function App() {
 
   useEffect(() => {
     refreshBattery();
-    applyBrightness(INITIAL_BRIGHTNESS);
-  }, [applyBrightness, refreshBattery]);
+    refreshBrightness();
+
+    const brightnessSubscription = subscribeToSystemBrightness(value => {
+      if (Number.isInteger(value) && value >= 0 && value <= 100) {
+        setBrightness(value);
+      }
+    });
+    const appStateSubscription = AppState.addEventListener('change', state => {
+      if (state === 'active') {
+        refreshBrightness();
+      }
+    });
+
+    return () => {
+      brightnessSubscription.remove();
+      appStateSubscription.remove();
+    };
+  }, [refreshBattery, refreshBrightness]);
 
   const handleBrightnessChange = value => {
     const next = Math.round(value);
     setBrightness(next);
-    applyBrightness(next);
+    setBrightnessError('');
+    setSystemBrightness(next)
+      .then(appliedValue => {
+        if (
+          Number.isInteger(appliedValue) &&
+          appliedValue >= 0 &&
+          appliedValue <= 100
+        ) {
+          setBrightness(appliedValue);
+        }
+      })
+      .catch(error => {
+        setBrightnessError(getErrorMessage(error));
+        refreshBrightness(false);
+      });
+  };
+
+  const handleOpenSystemSettings = async () => {
+    setBrightnessError('');
+    try {
+      await openSystemBrightnessSettings();
+    } catch (error) {
+      setBrightnessError(getErrorMessage(error));
+    }
   };
 
   return (
@@ -311,22 +366,42 @@ export default function App() {
           /* ── Brightness Screen ── */
           <View style={styles.brightnessScreen}>
             <SunCircle percentage={brightness} />
-            <Text style={styles.brightnessLabel}>Brightness</Text>
+            <Text style={styles.brightnessLabel}>System brightness</Text>
             <View style={styles.sliderRow}>
               <Text style={styles.sunIconDim}>☀</Text>
               <Slider
-                accessibilityLabel="App window brightness"
+                accessibilityLabel="System screen brightness"
                 style={styles.slider}
                 minimumValue={0}
                 maximumValue={100}
                 step={1}
-                value={brightness}
+                value={brightness ?? 50}
+                disabled={canModifySystemSettings !== true}
                 onValueChange={handleBrightnessChange}
                 minimumTrackTintColor="#2563eb"
                 maximumTrackTintColor="#fca5a5"
                 thumbTintColor="#2563eb"
               />
             </View>
+            {canModifySystemSettings === false ? (
+              <View style={styles.permissionNotice}>
+                <Text style={styles.permissionText}>
+                  Allow system settings access to change your phone brightness.
+                </Text>
+                <Pressable
+                  accessibilityRole="button"
+                  testID="grant-system-brightness-access"
+                  onPress={handleOpenSystemSettings}
+                  style={({pressed}) => [
+                    styles.permissionButton,
+                    pressed && {opacity: 0.75},
+                  ]}>
+                  <Text style={styles.permissionButtonText}>
+                    Grant access
+                  </Text>
+                </Pressable>
+              </View>
+            ) : null}
             {brightnessError ? (
               <Text style={styles.error}>{brightnessError}</Text>
             ) : null}
@@ -425,6 +500,29 @@ const styles = StyleSheet.create({
   slider: {
     flex: 1,
     height: 40,
+  },
+  permissionNotice: {
+    alignItems: 'center',
+    gap: 10,
+    paddingHorizontal: 12,
+    paddingTop: 6,
+  },
+  permissionText: {
+    color: '#64748b',
+    fontSize: 13,
+    lineHeight: 19,
+    textAlign: 'center',
+  },
+  permissionButton: {
+    backgroundColor: '#2563eb',
+    borderRadius: 18,
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+  },
+  permissionButtonText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '700',
   },
   /* Shared */
   error: {

@@ -1,15 +1,26 @@
 import React from 'react';
 import ReactTestRenderer, {act} from 'react-test-renderer';
-import {Text, TouchableOpacity} from 'react-native';
+import {DeviceEventEmitter, Text, TouchableOpacity} from 'react-native';
 import App from '../App';
 import {
+  canWriteSystemSettings,
   getBatteryPercentage,
-  setWindowBrightness,
+  getSystemBrightness,
+  openSystemBrightnessSettings,
+  setSystemBrightness,
 } from '../src/native/DeviceFeatures';
 
 jest.mock('../src/native/DeviceFeatures', () => ({
+  canWriteSystemSettings: jest.fn(),
   getBatteryPercentage: jest.fn(),
-  setWindowBrightness: jest.fn(),
+  getSystemBrightness: jest.fn(),
+  openSystemBrightnessSettings: jest.fn(),
+  setSystemBrightness: jest.fn(),
+  subscribeToSystemBrightness: listener =>
+    require('react-native').DeviceEventEmitter.addListener(
+      'systemBrightnessChanged',
+      listener,
+    ),
 }));
 
 jest.mock('@react-native-community/slider', () => {
@@ -18,14 +29,17 @@ jest.mock('@react-native-community/slider', () => {
     const MockReact = require('react');
     return MockReact.createElement(ReactNative.View, {
       testID: 'brightness-slider',
+      disabled: props.disabled,
       onValueChange: props.onValueChange,
     });
   };
 });
 
-test('shows battery data and applies slider brightness updates', async () => {
+test('shows battery data and keeps the slider synchronized with system brightness', async () => {
   getBatteryPercentage.mockResolvedValue(81);
-  setWindowBrightness.mockResolvedValue(true);
+  getSystemBrightness.mockResolvedValue(50);
+  canWriteSystemSettings.mockResolvedValue(true);
+  setSystemBrightness.mockResolvedValue(true);
 
   let renderer;
   await act(async () => {
@@ -38,7 +52,7 @@ test('shows battery data and applies slider brightness updates', async () => {
       .map(node => React.Children.toArray(node.props.children).join(''));
 
   expect(textContents()).toContain('81');
-  expect(setWindowBrightness).toHaveBeenCalledWith(50);
+  expect(getSystemBrightness).toHaveBeenCalled();
 
   await act(async () => {
     renderer.root.findAllByType(TouchableOpacity)[0].props.onPress();
@@ -51,7 +65,13 @@ test('shows battery data and applies slider brightness updates', async () => {
   });
 
   expect(textContents()).toContain('72%');
-  expect(setWindowBrightness).toHaveBeenLastCalledWith(72);
+  expect(setSystemBrightness).toHaveBeenLastCalledWith(72);
+
+  await act(async () => {
+    DeviceEventEmitter.emit('systemBrightnessChanged', 35);
+  });
+
+  expect(textContents()).toContain('35%');
 
   await act(async () => {
     renderer.unmount();
@@ -60,7 +80,8 @@ test('shows battery data and applies slider brightness updates', async () => {
 
 test('keeps a full battery percentage together on one line', async () => {
   getBatteryPercentage.mockResolvedValue(100);
-  setWindowBrightness.mockResolvedValue(true);
+  getSystemBrightness.mockResolvedValue(50);
+  canWriteSystemSettings.mockResolvedValue(true);
 
   let renderer;
   await act(async () => {
@@ -73,6 +94,38 @@ test('keeps a full battery percentage together on one line', async () => {
 
   expect(textContents).toContain('100');
   expect(textContents).toContain('%');
+
+  await act(async () => {
+    renderer.unmount();
+  });
+});
+
+test('asks for system settings access before enabling brightness control', async () => {
+  getBatteryPercentage.mockResolvedValue(81);
+  getSystemBrightness.mockResolvedValue(35);
+  canWriteSystemSettings.mockResolvedValue(false);
+  openSystemBrightnessSettings.mockResolvedValue(true);
+
+  let renderer;
+  await act(async () => {
+    renderer = ReactTestRenderer.create(<App />);
+  });
+
+  await act(async () => {
+    renderer.root.findAllByType(TouchableOpacity)[0].props.onPress();
+  });
+
+  expect(
+    renderer.root.findByProps({testID: 'brightness-slider'}).props.disabled,
+  ).toBe(true);
+
+  await act(async () => {
+    renderer.root
+      .findByProps({testID: 'grant-system-brightness-access'})
+      .props.onPress();
+  });
+
+  expect(openSystemBrightnessSettings).toHaveBeenCalled();
 
   await act(async () => {
     renderer.unmount();
